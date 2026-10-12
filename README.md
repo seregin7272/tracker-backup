@@ -110,3 +110,35 @@ y0_bbb
   ротацию настройте через `logrotate`.
 - Код выхода 1 или 2 означает ошибки (см. «Инкрементальность»). Скрипт пишет лог в stderr при каждом
   прогоне, поэтому для алертов проверяйте непустой `errors.json` или свежесть `state.json` мониторингом.
+
+## Запуск в Docker
+
+```bash
+docker build -t tracker-backup .
+```
+
+Бекап пишется в `/backup` внутри контейнера, токены передаются файлом только для чтения,
+остальные переменные — через `--env-file` (формат тот же, что у `/etc/tracker-backup.env` выше):
+
+```bash
+docker run --rm \
+  --env-file /etc/tracker-backup.env \
+  -v /etc/tracker-backup.tokens:/run/secrets/tokens:ro \
+  -v /backup/tracker:/backup \
+  tracker-backup --out /backup --tokens-file /run/secrets/tokens
+```
+
+Аргументы после имени образа передаются скрипту как есть (`--queues`, `--full`, `--no-files`, `-v` …).
+
+- Процесс в контейнере работает от пользователя с UID 10001: каталог бекапа на хосте должен быть
+  доступен ему на запись (`chown 10001 /backup/tracker`), а файл токенов — на чтение.
+- `docker stop` останавливает бекап корректно: скрипт обрабатывает SIGTERM так же, как Ctrl+C —
+  пишет `errors.json`, не сдвигает `state.json` для прерванной очереди и выходит с кодом 130.
+  По умолчанию Docker ждёт 10 секунд; если идёт загрузка крупных вложений, увеличьте `docker stop -t`.
+- Время в логах — UTC; для местного времени добавьте `-e TZ=Europe/Moscow`.
+
+Ежедневный запуск через cron на хосте:
+
+```cron
+30 3 * * * flock -n /tmp/tracker-backup.lock docker run --rm --env-file /etc/tracker-backup.env -v /etc/tracker-backup.tokens:/run/secrets/tokens:ro -v /backup/tracker:/backup tracker-backup --out /backup --tokens-file /run/secrets/tokens >> /var/log/tracker-backup.log 2>&1
+```

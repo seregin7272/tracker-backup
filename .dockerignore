@@ -1,0 +1,8 @@
+.git
+.idea
+.venv
+__pycache__
+tracker-backup
+backup
+tokens.txt
+*.env

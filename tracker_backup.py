@@ -35,6 +35,7 @@ import logging
 import os
 import random
 import re
+import signal
 import sys
 import threading
 import time
@@ -451,7 +452,13 @@ def org_headers() -> dict:
     sys.exit("нужен TRACKER_ORG_ID или TRACKER_CLOUD_ORG_ID")
 
 
+def _on_sigterm(signum, frame):
+    # docker stop шлёт SIGTERM; у PID 1 без своего обработчика сигнал игнорируется
+    raise KeyboardInterrupt
+
+
 def main():
+    signal.signal(signal.SIGTERM, _on_sigterm)
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="./tracker-backup")
     ap.add_argument("--queues", help="DEV,OPS; по умолчанию все очереди")
@@ -482,7 +489,7 @@ def main():
     started = (datetime.now(timezone.utc) - STATE_OVERLAP).strftime("%Y-%m-%dT%H:%M:%S.000+0000")
 
     errors: list = []
-    total = failed = 0
+    progs: list[Progress] = []  # включая прерванную очередь — для итоговой статистики
     code = 0
     ex = ThreadPoolExecutor(workers)
     try:
@@ -495,15 +502,14 @@ def main():
 
         for q in queues:
             prog = Progress(q, errors)
+            progs.append(prog)
             backup_queue(tr, ex, prog, None if a.full else state.get(q), root, not a.no_files, workers * 4)
-            total += prog.done
-            failed += prog.failed
             log.info("%s: готово %d, ошибок %d", q, prog.done, prog.failed)
             if not prog.failed:  # с ошибками не сдвигаем state — в следующий раз перекачаем
                 state[q] = started
                 dump(state_f, state)
     except KeyboardInterrupt:
-        log.warning("прервано, state для текущей очереди не сохранён")
+        log.warning("прервано (Ctrl+C / SIGTERM), state для текущей очереди не сохранён")
         code = 130
     except (NoTokensLeft, requests.RequestException, ValueError) as e:
         log.error("остановка: %s", e)
@@ -512,6 +518,7 @@ def main():
         ex.shutdown(wait=code == 0, cancel_futures=code != 0)
         dump(root / "errors.json", errors)
 
+    total, failed = sum(p.done for p in progs), sum(p.failed for p in progs)
     log.info("done: %d issues, ошибок по задачам %d, всего записей в errors.json %d; %s",
              total, failed, len(errors), pool.stats())
     sys.exit(code or (1 if errors else 0))
