@@ -227,9 +227,9 @@ class Tracker:
         return self.request("GET", url, **kw)
 
 
-def scroll(tr: Tracker, body: dict):
+def scroll(tr: Tracker, body: dict, per_scroll: int = 1000):
     """Scroll-поиск (обходит лимит 10k). Scroll привязан к токену первого запроса."""
-    params = {"scrollType": "sorted", "perScroll": 1000, "scrollTTLMillis": 60000}
+    params = {"scrollType": "sorted", "perScroll": per_scroll, "scrollTTLMillis": 60000}
     r = tr.request("POST", f"{API}/issues/_search", params=params, json=body)
     pin = r.token
     while True:
@@ -243,14 +243,17 @@ def scroll(tr: Tracker, body: dict):
                        params={"scrollId": sid, "scrollTTLMillis": 60000}, json=body)
 
 
-def search_keys(tr: Tracker, body: dict, on_issue) -> list[str]:
-    """Проходит scroll до конца, вызывая on_issue на каждой задаче; при обрыве начинает заново."""
+def search_keys(tr: Tracker, body: dict, on_issue, limit: int | None = None) -> list[str]:
+    """Проходит scroll до конца (или до limit задач), вызывая on_issue на каждой задаче;
+    при обрыве начинает заново."""
     for attempt in range(SCROLL_RESTARTS + 1):
         keys: dict[str, None] = {}
         try:
-            for issue in scroll(tr, body):
+            for issue in scroll(tr, body, min(1000, limit) if limit else 1000):
                 on_issue(issue)
                 keys[issue["key"]] = None
+                if limit and len(keys) >= limit:
+                    break
             return list(keys)
         except (requests.RequestException, ValueError, PinnedTokenDead) as e:
             if attempt == SCROLL_RESTARTS:
@@ -395,14 +398,16 @@ class Progress:
 
 
 def backup_queue(tr: Tracker, ex: ThreadPoolExecutor, prog: Progress, since: str | None,
-                 root: Path, with_files: bool, inflight: int):
+                 root: Path, with_files: bool, inflight: int, limit: int | None = None):
     q = prog.q
     backup_queue_meta(tr, q, root, prog.errors)
     flt = {"queue": q}
     if since:
         flt["updated"] = {"from": since}
     try:
-        keys = search_keys(tr, {"filter": flt, "order": "+updated"}, lambda issue: save_issue(root, issue))
+        # с limit берём самые свежие задачи — для проверки они интереснее
+        body = {"filter": flt, "order": "-updated" if limit else "+updated"}
+        keys = search_keys(tr, body, lambda issue: save_issue(root, issue), limit)
     except (requests.RequestException, ValueError, PinnedTokenDead) as e:
         prog.fail(f"{q}/_search", e)
         return
@@ -467,6 +472,8 @@ def main():
     ap.add_argument("--tokens-file", help="файл с токенами, по одному в строке")
     ap.add_argument("--rps", type=float, default=float(os.getenv("TRACKER_RPS", "5")),
                     help="лимит запросов в секунду на один токен (0 — без лимита)")
+    ap.add_argument("--limit", type=int,
+                    help="не больше N самых свежих задач на очередь, state.json не обновляется (для проверки)")
     ap.add_argument("--workers", type=int, help="число потоков; по умолчанию 4 на токен, максимум 32")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
@@ -503,9 +510,11 @@ def main():
         for q in queues:
             prog = Progress(q, errors)
             progs.append(prog)
-            backup_queue(tr, ex, prog, None if a.full else state.get(q), root, not a.no_files, workers * 4)
+            backup_queue(tr, ex, prog, None if a.full else state.get(q), root, not a.no_files, workers * 4,
+                         a.limit)
             log.info("%s: готово %d, ошибок %d", q, prog.done, prog.failed)
-            if not prog.failed:  # с ошибками не сдвигаем state — в следующий раз перекачаем
+            # с ошибками не сдвигаем state — в следующий раз перекачаем; с --limit выгружена лишь часть
+            if not prog.failed and not a.limit:
                 state[q] = started
                 dump(state_f, state)
     except KeyboardInterrupt:
