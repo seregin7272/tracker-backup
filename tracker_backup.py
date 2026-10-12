@@ -378,7 +378,7 @@ class Progress:
 
     def __init__(self, q: str, errors: list):
         self.q, self.errors = q, errors
-        self.done = self.failed = 0
+        self.done = self.failed = self.found = 0
         self.fatal: BaseException | None = None
         self.lock = threading.Lock()
         self.last_log = time.monotonic()
@@ -411,6 +411,7 @@ def backup_queue(tr: Tracker, ex: ThreadPoolExecutor, prog: Progress, since: str
     except (requests.RequestException, ValueError, PinnedTokenDead) as e:
         prog.fail(f"{q}/_search", e)
         return
+    prog.found = len(keys)
     log.info("%s: найдено %d задач", q, len(keys))
 
     sem = threading.BoundedSemaphore(inflight)  # ограничиваем число задач в работе
@@ -513,10 +514,18 @@ def main():
             backup_queue(tr, ex, prog, None if a.full else state.get(q), root, not a.no_files, workers * 4,
                          a.limit)
             log.info("%s: готово %d, ошибок %d", q, prog.done, prog.failed)
-            # с ошибками не сдвигаем state — в следующий раз перекачаем; с --limit выгружена лишь часть
-            if not prog.failed and not a.limit:
-                state[q] = started
-                dump(state_f, state)
+            # Не сдвигаем state: с ошибками — в следующий раз перекачаем; с --limit выгружена лишь часть;
+            # при пустом поиске — Трекер может временно отдавать пустой результат (нет прав, нагрузка),
+            # и сдвинутая отметка навсегда отрезала бы старые задачи. Повторный пустой поиск — один запрос.
+            if prog.failed or a.limit:
+                continue
+            if not prog.found:
+                if q not in state or a.full:
+                    log.warning("%s: поиск не нашёл ни одной задачи — проверьте доступ токенов к очереди; "
+                                "отметка в state.json не изменена", q)
+                continue
+            state[q] = started
+            dump(state_f, state)
     except KeyboardInterrupt:
         log.warning("прервано (Ctrl+C / SIGTERM), state для текущей очереди не сохранён")
         code = 130
