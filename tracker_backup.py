@@ -243,16 +243,24 @@ def scroll(tr: Tracker, body: dict, per_scroll: int = 1000):
                        params={"scrollId": sid, "scrollTTLMillis": 60000}, json=body)
 
 
+def scroll_page_size(limit: int | None) -> int:
+    """Страницы по 1000, а с limit — поровну, чтобы последняя страница не качалась почти впустую."""
+    if limit is None:
+        return 1000
+    pages_needed = -(-limit // 1000)
+    return -(-limit // pages_needed)
+
+
 def search_keys(tr: Tracker, body: dict, on_issue, limit: int | None = None) -> list[str]:
     """Проходит scroll до конца (или до limit задач), вызывая on_issue на каждой задаче;
     при обрыве начинает заново."""
     for attempt in range(SCROLL_RESTARTS + 1):
         keys: dict[str, None] = {}
         try:
-            for issue in scroll(tr, body, min(1000, limit) if limit else 1000):
+            for issue in scroll(tr, body, scroll_page_size(limit)):
                 on_issue(issue)
                 keys[issue["key"]] = None
-                if limit and len(keys) >= limit:
+                if limit is not None and len(keys) >= limit:
                     break
             return list(keys)
         except (requests.RequestException, ValueError, PinnedTokenDead) as e:
@@ -295,9 +303,14 @@ def pages(tr: Tracker, url: str, **params) -> list:
 # ---------------------------------------------------------------- backup
 
 def dump(p: Path, data):
+    """Пишет во временный файл и переименовывает: готовый файл не бывает полузаписанным."""
     tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, p)
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, p)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def safe_name(name: str) -> str:
@@ -361,7 +374,10 @@ def backup_meta(tr: Tracker, root: Path, errors: list):
             errors.append({"key": f"_meta/{name}", "error": repr(e)})
 
 
-def backup_queue_meta(tr: Tracker, q: str, root: Path, errors: list):
+def backup_queue_meta(tr: Tracker, prog: Progress, root: Path):
+    """Ошибка здесь — ошибка очереди: 403 на /queues/{q} обычно значит, что токену не хватает прав,
+    и тогда поиск может вернуть лишь часть задач. Отметку в state.json в этом случае сдвигать нельзя."""
+    q = prog.q
     d = root / q / "_queue"
     d.mkdir(parents=True, exist_ok=True)
     for name, url, params in (("queue", f"{API}/queues/{q}", {"expand": "all"}),
@@ -369,8 +385,7 @@ def backup_queue_meta(tr: Tracker, q: str, root: Path, errors: list):
         try:
             dump(d / f"{name}.json", tr.get(url, params=params).json())
         except (requests.RequestException, ValueError) as e:
-            log.warning("%s/_queue/%s: %s", q, name, e)
-            errors.append({"key": f"{q}/_queue/{name}", "error": repr(e)})
+            prog.fail(f"{q}/_queue/{name}", e)
 
 
 class Progress:
@@ -378,7 +393,7 @@ class Progress:
 
     def __init__(self, q: str, errors: list):
         self.q, self.errors = q, errors
-        self.done = self.failed = self.found = 0
+        self.done = self.failed = 0
         self.fatal: BaseException | None = None
         self.lock = threading.Lock()
         self.last_log = time.monotonic()
@@ -398,20 +413,20 @@ class Progress:
 
 
 def backup_queue(tr: Tracker, ex: ThreadPoolExecutor, prog: Progress, since: str | None,
-                 root: Path, with_files: bool, inflight: int, limit: int | None = None):
+                 root: Path, with_files: bool, inflight: int, limit: int | None = None) -> int:
+    """Выгружает очередь и возвращает число задач, найденных поиском."""
     q = prog.q
-    backup_queue_meta(tr, q, root, prog.errors)
+    backup_queue_meta(tr, prog, root)
     flt = {"queue": q}
     if since:
         flt["updated"] = {"from": since}
     try:
         # с limit берём самые свежие задачи — для проверки они интереснее
-        body = {"filter": flt, "order": "-updated" if limit else "+updated"}
+        body = {"filter": flt, "order": "+updated" if limit is None else "-updated"}
         keys = search_keys(tr, body, lambda issue: save_issue(root, issue), limit)
     except (requests.RequestException, ValueError, PinnedTokenDead) as e:
         prog.fail(f"{q}/_search", e)
-        return
-    prog.found = len(keys)
+        return 0
     log.info("%s: найдено %d задач", q, len(keys))
 
     sem = threading.BoundedSemaphore(inflight)  # ограничиваем число задач в работе
@@ -436,6 +451,14 @@ def backup_queue(tr: Tracker, ex: ThreadPoolExecutor, prog: Progress, since: str
         sem.acquire()
     if prog.fatal:
         raise prog.fatal
+    return len(keys)
+
+
+def positive_int(v: str) -> int:
+    n = int(v)
+    if n < 1:
+        raise argparse.ArgumentTypeError("нужно целое число не меньше 1")
+    return n
 
 
 def load_tokens(a) -> list[Token]:
@@ -473,7 +496,7 @@ def main():
     ap.add_argument("--tokens-file", help="файл с токенами, по одному в строке")
     ap.add_argument("--rps", type=float, default=float(os.getenv("TRACKER_RPS", "5")),
                     help="лимит запросов в секунду на один токен (0 — без лимита)")
-    ap.add_argument("--limit", type=int,
+    ap.add_argument("--limit", type=positive_int, metavar="N",
                     help="не больше N самых свежих задач на очередь, state.json не обновляется (для проверки)")
     ap.add_argument("--workers", type=int, help="число потоков; по умолчанию 4 на токен, максимум 32")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -511,18 +534,20 @@ def main():
         for q in queues:
             prog = Progress(q, errors)
             progs.append(prog)
-            backup_queue(tr, ex, prog, None if a.full else state.get(q), root, not a.no_files, workers * 4,
-                         a.limit)
+            found = backup_queue(tr, ex, prog, None if a.full else state.get(q), root, not a.no_files,
+                                 workers * 4, a.limit)
             log.info("%s: готово %d, ошибок %d", q, prog.done, prog.failed)
             # Не сдвигаем state: с ошибками — в следующий раз перекачаем; с --limit выгружена лишь часть;
             # при пустом поиске — Трекер может временно отдавать пустой результат (нет прав, нагрузка),
             # и сдвинутая отметка навсегда отрезала бы старые задачи. Повторный пустой поиск — один запрос.
-            if prog.failed or a.limit:
+            if prog.failed or a.limit is not None:
                 continue
-            if not prog.found:
+            if not found:
                 if q not in state or a.full:
                     log.warning("%s: поиск не нашёл ни одной задачи — проверьте доступ токенов к очереди; "
                                 "отметка в state.json не изменена", q)
+                else:
+                    log.info("%s: изменений с %s нет, отметка в state.json не изменена", q, state[q])
                 continue
             state[q] = started
             dump(state_f, state)
@@ -537,7 +562,7 @@ def main():
         dump(root / "errors.json", errors)
 
     total, failed = sum(p.done for p in progs), sum(p.failed for p in progs)
-    log.info("done: %d issues, ошибок по задачам %d, всего записей в errors.json %d; %s",
+    log.info("done: %d issues, ошибок в очередях %d, всего записей в errors.json %d; %s",
              total, failed, len(errors), pool.stats())
     sys.exit(code or (1 if errors else 0))
 
