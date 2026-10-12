@@ -78,3 +78,35 @@ export TRACKER_TOKENS=y0_aaa,y0_bbb    # пул токенов
 Все ошибки за прогон (задачи, поиск, метаданные) пишутся в `errors.json`, в том числе при аварийной
 остановке. Код выхода: 0 — без ошибок, 1 — есть ошибки, 2 — остановка (все токены отозваны или не
 удалось получить список очередей), 130 — прервано по Ctrl+C.
+
+## Ежедневный запуск по cron
+
+Cron запускает команды с почти пустым окружением, поэтому переменные лучше вынести в отдельный файл,
+а токены — в `--tokens-file`. Оба файла должны быть доступны только владельцу (`chmod 600`).
+
+```bash
+# /etc/tracker-backup.env
+TRACKER_ORG_ID=1234567
+TRACKER_RPS=5
+```
+
+```bash
+# /etc/tracker-backup.tokens — по токену в строке
+y0_aaa
+y0_bbb
+```
+
+`crontab -e` (пример: каждый день в 03:30, проект в `/opt/tracker-backup`):
+
+```cron
+30 3 * * * cd /opt/tracker-backup && set -a && . /etc/tracker-backup.env && set +a && flock -n /tmp/tracker-backup.lock .venv/bin/python tracker_backup.py --out /backup/tracker --tokens-file /etc/tracker-backup.tokens >> /var/log/tracker-backup.log 2>&1
+```
+
+- `set -a` + `.` экспортирует все переменные из env-файла в окружение скрипта.
+- `flock -n` не даёт запустить второй бекап, пока не закончился предыдущий: первый полный прогон
+  может идти дольше суток. `flock` есть в Linux (util-linux), в macOS его нужно ставить отдельно
+  (`brew install flock`).
+- Лог дописывается в `/var/log/tracker-backup.log` — у пользователя cron должны быть права на запись,
+  ротацию настройте через `logrotate`.
+- Код выхода 1 или 2 означает ошибки (см. «Инкрементальность»). Скрипт пишет лог в stderr при каждом
+  прогоне, поэтому для алертов проверяйте непустой `errors.json` или свежесть `state.json` мониторингом.
