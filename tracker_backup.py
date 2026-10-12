@@ -10,6 +10,10 @@
 Инкрементально: state.json хранит время последнего успешного прогона очереди,
 следующий запуск берёт updated >= last (с небольшим перекрытием).
 
+Очередь обрабатывается в два этапа: сначала scroll-поиск быстро проходит все задачи
+и сохраняет issue.json, затем комментарии, историю, связи и вложения качают потоки.
+Так scroll-контекст не успевает истечь, пока идёт медленная выгрузка.
+
 Пул токенов: запросы распределяются между токенами, у каждого свой лимит RPS.
 На 429 токен уходит в cooldown (Retry-After / X-RateLimit-Reset / экспоненциально),
 запрос повторяется другим свободным токеном. Токен с 401 исключается из пула.
@@ -34,7 +38,7 @@ import re
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -44,6 +48,8 @@ import requests
 API = os.getenv("TRACKER_API", "https://api.tracker.yandex.net/v3")
 RETRY_STATUSES = {500, 502, 503, 504}
 STATE_OVERLAP = timedelta(minutes=5)
+MAX_PAUSE = 300.0      # верхняя граница паузы токена, что бы ни прислал сервер
+SCROLL_RESTARTS = 3    # сколько раз начинать поиск заново, если scroll оборвался
 
 log = logging.getLogger("tracker-backup")
 
@@ -51,7 +57,11 @@ log = logging.getLogger("tracker-backup")
 # ---------------------------------------------------------------- token pool
 
 class NoTokensLeft(RuntimeError):
-    pass
+    """Все токены пула отозваны — продолжать бекап нечем."""
+
+
+class PinnedTokenDead(RuntimeError):
+    """Отозван токен, к которому привязан scroll; остальные токены могут быть живы."""
 
 
 class Token:
@@ -73,19 +83,26 @@ class Token:
 
 
 def _seconds_header(r: requests.Response, name: str) -> float | None:
-    """Retry-After / X-RateLimit-Reset: секунды, unix-время или HTTP-дата."""
+    """Retry-After / X-RateLimit-Reset: секунды, unix-время (с или мс) или HTTP-дата."""
     v = r.headers.get(name)
     if not v:
         return None
     try:
         x = float(v)
-        return max(0.0, x - time.time()) if x > 1e9 else max(0.0, x)
     except ValueError:
-        pass
-    try:
-        return max(0.0, (parsedate_to_datetime(v) - datetime.now(timezone.utc)).total_seconds())
-    except (TypeError, ValueError):
-        return None
+        try:
+            x = parsedate_to_datetime(v).timestamp()
+        except (TypeError, ValueError):
+            return None
+    if x > 1e12:
+        x /= 1000
+    if x > 1e9:
+        x -= time.time()
+    return max(0.0, x)
+
+
+def _clamp_pause(pause: float) -> float:
+    return min(MAX_PAUSE, max(0.5, pause))
 
 
 class TokenPool:
@@ -100,10 +117,11 @@ class TokenPool:
         """Выбирает токен, который освободится раньше всех, резервирует слот и ждёт его."""
         while True:
             with self.lock:
-                cands = [pin] if pin else self.tokens
-                cands = [t for t in cands if not t.dead]
+                if pin and pin.dead:
+                    raise PinnedTokenDead(f"токен {pin.name} отозван (401)")
+                cands = [pin] if pin else [t for t in self.tokens if not t.dead]
                 if not cands:
-                    raise NoTokensLeft(f"токен {pin.name} отозван (401)" if pin else "все токены отозваны (401)")
+                    raise NoTokensLeft("все токены отозваны (401)")
                 now = time.monotonic()
                 tok = min(cands, key=lambda t: (t.ready_at(), t.requests))
                 start = max(now, tok.ready_at())
@@ -114,7 +132,7 @@ class TokenPool:
             if delay > 0:
                 time.sleep(delay)
             with self.lock:
-                # пока спали, токен мог словить 429 в другом потоке
+                # пока спали, токен мог словить 429 или 401 в другом потоке
                 if tok.dead or tok.cooldown_until > time.monotonic():
                     continue
                 tok.requests += 1
@@ -126,9 +144,12 @@ class TokenPool:
             if r.status_code == 429:
                 tok.throttled += 1
                 tok.strikes += 1
-                pause = _seconds_header(r, "Retry-After") or _seconds_header(r, "X-RateLimit-Reset")
+                pause = _seconds_header(r, "Retry-After")
                 if pause is None:
-                    pause = min(60.0, 2.0 ** tok.strikes) * random.uniform(0.75, 1.25)
+                    pause = _seconds_header(r, "X-RateLimit-Reset")
+                if pause is None:
+                    pause = 2.0 ** tok.strikes * random.uniform(0.75, 1.25)
+                pause = _clamp_pause(pause)
                 tok.cooldown_until = max(tok.cooldown_until, now + pause)
                 log.debug("429 на токене %s, пауза %.1fs", tok.name, pause)
             elif r.status_code == 401:
@@ -138,7 +159,8 @@ class TokenPool:
             else:
                 tok.strikes = 0
                 if r.headers.get("X-RateLimit-Remaining") == "0":
-                    pause = _seconds_header(r, "X-RateLimit-Reset") or 1.0
+                    pause = _seconds_header(r, "X-RateLimit-Reset")
+                    pause = _clamp_pause(1.0 if pause is None else pause)
                     tok.cooldown_until = max(tok.cooldown_until, now + pause)
 
     def stats(self) -> str:
@@ -164,16 +186,22 @@ class Tracker:
             s.headers.update(self.org_headers)
         return s
 
-    def request(self, method: str, url: str, pin: Token | None = None, **kw) -> requests.Response:
-        """Запрос через пул. В r.token кладётся токен, которым запрос выполнен."""
+    def request(self, method: str, url: str, pin: Token | None = None, retry: bool = True,
+                **kw) -> requests.Response:
+        """Запрос через пул. В r.token кладётся токен, которым запрос выполнен.
+
+        retry=False — для неидемпотентных запросов: таймауты и 5xx не повторяются
+        (сервер мог успеть обработать запрос), повторяется только 429.
+        """
         errors = throttles = 0
+        attempts = self.attempts if retry else 1
         while True:
             tok = self.pool.acquire(pin)
             try:
                 r = self._session().request(method, url, headers={"Authorization": tok.auth}, timeout=60, **kw)
             except (requests.ConnectionError, requests.Timeout):
                 errors += 1
-                if errors >= self.attempts:
+                if errors >= attempts:
                     raise
                 time.sleep(min(30.0, 2.0 ** errors))
                 continue
@@ -186,7 +214,7 @@ class Tracker:
             if r.status_code == 401 and pin is None:
                 r.close()
                 continue
-            if r.status_code in RETRY_STATUSES and errors + 1 < self.attempts:
+            if r.status_code in RETRY_STATUSES and errors + 1 < attempts:
                 errors += 1
                 r.close()
                 time.sleep(min(30.0, 2.0 ** errors))
@@ -198,7 +226,7 @@ class Tracker:
         return self.request("GET", url, **kw)
 
 
-def search(tr: Tracker, body: dict):
+def scroll(tr: Tracker, body: dict):
     """Scroll-поиск (обходит лимит 10k). Scroll привязан к токену первого запроса."""
     params = {"scrollType": "sorted", "perScroll": 1000, "scrollTTLMillis": 60000}
     r = tr.request("POST", f"{API}/issues/_search", params=params, json=body)
@@ -209,22 +237,41 @@ def search(tr: Tracker, body: dict):
         sid = r.headers.get("X-Scroll-Id")
         if not page or not sid:
             return
-        r = tr.request("POST", f"{API}/issues/_search", pin=pin,
+        # повтор продолжения с тем же scrollId может молча пропустить страницу
+        r = tr.request("POST", f"{API}/issues/_search", pin=pin, retry=False,
                        params={"scrollId": sid, "scrollTTLMillis": 60000}, json=body)
 
 
+def search_keys(tr: Tracker, body: dict, on_issue) -> list[str]:
+    """Проходит scroll до конца, вызывая on_issue на каждой задаче; при обрыве начинает заново."""
+    for attempt in range(SCROLL_RESTARTS + 1):
+        keys: dict[str, None] = {}
+        try:
+            for issue in scroll(tr, body):
+                on_issue(issue)
+                keys[issue["key"]] = None
+            return list(keys)
+        except (requests.RequestException, ValueError, PinnedTokenDead) as e:
+            if attempt == SCROLL_RESTARTS:
+                raise
+            log.warning("scroll оборвался после %d задач (%s), поиск заново", len(keys), e)
+
+
 def paged(tr: Tracker, url: str) -> list:
-    """Пагинация comments/changelog через id последнего элемента."""
+    """Пагинация comments/changelog через id последнего элемента — до пустой страницы.
+
+    Короткая страница не значит, что она последняя: сервер может урезать perPage.
+    Если сервер прислал Link без rel=next — страниц больше нет, лишний запрос не делаем.
+    """
     out, last = [], None
     while True:
         params = {"perPage": 100, "expand": "all"}
         if last:
             params["id"] = last
-        page = tr.get(url, params=params).json()
-        if not page:
-            return out
+        r = tr.get(url, params=params)
+        page = r.json()
         out += page
-        if len(page) < 100:
+        if not page or ("Link" in r.headers and "next" not in r.links):
             return out
         last = page[-1]["id"]
 
@@ -253,6 +300,16 @@ def safe_name(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")[:200] or "file"
 
 
+def issue_dir(root: Path, key: str) -> Path:
+    return root / key.split("-")[0] / key
+
+
+def save_issue(root: Path, issue: dict):
+    d = issue_dir(root, issue["key"])
+    d.mkdir(parents=True, exist_ok=True)
+    dump(d / "issue.json", issue)
+
+
 def download(tr: Tracker, url: str, dst: Path, attempts: int = 3):
     part = dst.with_name(dst.name + ".part")
     for i in range(attempts):
@@ -270,11 +327,9 @@ def download(tr: Tracker, url: str, dst: Path, attempts: int = 3):
             part.unlink(missing_ok=True)
 
 
-def backup_issue(tr: Tracker, issue: dict, root: Path, with_files: bool):
-    key = issue["key"]
-    d = root / key.split("-")[0] / key
-    d.mkdir(parents=True, exist_ok=True)
-    dump(d / "issue.json", issue)
+def backup_issue(tr: Tracker, key: str, root: Path, with_files: bool):
+    """Всё, кроме самой задачи: issue.json уже сохранён на этапе поиска."""
+    d = issue_dir(root, key)
     dump(d / "comments.json", paged(tr, f"{API}/issues/{key}/comments"))
     dump(d / "changelog.json", paged(tr, f"{API}/issues/{key}/changelog"))
     dump(d / "links.json", tr.get(f"{API}/issues/{key}/links").json())
@@ -290,31 +345,37 @@ def backup_issue(tr: Tracker, issue: dict, root: Path, with_files: bool):
         download(tr, a["content"], f)
 
 
-def backup_meta(tr: Tracker, root: Path):
+def backup_meta(tr: Tracker, root: Path, errors: list):
     """Описания полей и справочники — без них значения полей в issue.json трудно восстановить."""
     d = root / "_meta"
     d.mkdir(parents=True, exist_ok=True)
     for name in ("fields", "statuses", "priorities", "issuetypes", "resolutions", "linktypes"):
         try:
             dump(d / f"{name}.json", tr.get(f"{API}/{name}").json())
-        except requests.HTTPError as e:
+        except (requests.RequestException, ValueError) as e:
             log.warning("_meta/%s: %s", name, e)
+            errors.append({"key": f"_meta/{name}", "error": repr(e)})
 
 
-def backup_queue_meta(tr: Tracker, q: str, root: Path):
+def backup_queue_meta(tr: Tracker, q: str, root: Path, errors: list):
     d = root / q / "_queue"
     d.mkdir(parents=True, exist_ok=True)
     for name, url, params in (("queue", f"{API}/queues/{q}", {"expand": "all"}),
                               ("localFields", f"{API}/queues/{q}/localFields", None)):
         try:
             dump(d / f"{name}.json", tr.get(url, params=params).json())
-        except requests.HTTPError as e:
+        except (requests.RequestException, ValueError) as e:
             log.warning("%s/_queue/%s: %s", q, name, e)
+            errors.append({"key": f"{q}/_queue/{name}", "error": repr(e)})
 
 
 class Progress:
-    def __init__(self, q: str):
-        self.q, self.done, self.failed = q, 0, []
+    """Счётчики очереди. Ошибки задач пишутся сразу в общий список, чтобы не потеряться при аварии."""
+
+    def __init__(self, q: str, errors: list):
+        self.q, self.errors = q, errors
+        self.done = self.failed = 0
+        self.fatal: BaseException | None = None
         self.lock = threading.Lock()
         self.last_log = time.monotonic()
 
@@ -327,42 +388,47 @@ class Progress:
 
     def fail(self, key: str, e: BaseException):
         with self.lock:
-            self.failed.append({"key": key, "error": repr(e)})
+            self.failed += 1
+            self.errors.append({"key": key, "error": repr(e)})
         log.error("%s: %s", key, e)
 
 
-def backup_queue(tr: Tracker, ex: ThreadPoolExecutor, q: str, since: str | None,
-                 root: Path, with_files: bool, inflight: int) -> Progress:
-    backup_queue_meta(tr, q, root)
+def backup_queue(tr: Tracker, ex: ThreadPoolExecutor, prog: Progress, since: str | None,
+                 root: Path, with_files: bool, inflight: int):
+    q = prog.q
+    backup_queue_meta(tr, q, root, prog.errors)
     flt = {"queue": q}
     if since:
         flt["updated"] = {"from": since}
-    prog = Progress(q)
-    sem = threading.BoundedSemaphore(inflight)  # не держим в памяти весь результат поиска
+    try:
+        keys = search_keys(tr, {"filter": flt, "order": "+updated"}, lambda issue: save_issue(root, issue))
+    except (requests.RequestException, ValueError, PinnedTokenDead) as e:
+        prog.fail(f"{q}/_search", e)
+        return
+    log.info("%s: найдено %d задач", q, len(keys))
 
-    def run(issue):
+    sem = threading.BoundedSemaphore(inflight)  # ограничиваем число задач в работе
+
+    def run(key):
         try:
-            backup_issue(tr, issue, root, with_files)
-            prog.ok(issue["key"])
-        except NoTokensLeft:
-            raise
+            backup_issue(tr, key, root, with_files)
+            prog.ok(key)
+        except NoTokensLeft as e:
+            prog.fatal = e
         except Exception as e:
-            prog.fail(issue["key"], e)
+            prog.fail(key, e)
         finally:
             sem.release()
 
-    futs = []
-    try:
-        for issue in search(tr, {"filter": flt, "order": "+updated"}):
-            sem.acquire()
-            futs.append(ex.submit(run, issue))
-    except (requests.RequestException, ValueError) as e:
-        prog.fail(f"{q}/_search", e)
-    wait(futs)
-    for f in futs:
-        if isinstance(f.exception(), NoTokensLeft):
-            raise f.exception()
-    return prog
+    for key in keys:
+        if prog.fatal:
+            break
+        sem.acquire()
+        ex.submit(run, key)
+    for _ in range(inflight):  # ждём, пока доработают все задачи очереди
+        sem.acquire()
+    if prog.fatal:
+        raise prog.fatal
 
 
 def load_tokens(a) -> list[Token]:
@@ -389,7 +455,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="./tracker-backup")
     ap.add_argument("--queues", help="DEV,OPS; по умолчанию все очереди")
-    ap.add_argument("--full", action="store_true", help="игнорировать state.json")
+    ap.add_argument("--full", action="store_true", help="игнорировать state.json при выборе задач")
     ap.add_argument("--no-files", action="store_true", help="не скачивать вложения")
     ap.add_argument("--tokens-file", help="файл с токенами, по одному в строке")
     ap.add_argument("--rps", type=float, default=float(os.getenv("TRACKER_RPS", "5")),
@@ -411,36 +477,44 @@ def main():
     root = Path(a.out)
     root.mkdir(parents=True, exist_ok=True)
     state_f = root / "state.json"
-    state = json.loads(state_f.read_text()) if state_f.exists() and not a.full else {}
+    # --full не трогает отметки очередей, которые в этот прогон не входят
+    state = json.loads(state_f.read_text()) if state_f.exists() else {}
     started = (datetime.now(timezone.utc) - STATE_OVERLAP).strftime("%Y-%m-%dT%H:%M:%S.000+0000")
 
-    backup_meta(tr, root)
-    queues = a.queues.split(",") if a.queues else [q["key"] for q in pages(tr, f"{API}/queues")]
-    dump(root / "queues.json", queues)
-
-    total, failed = 0, []
+    errors: list = []
+    total = failed = 0
+    code = 0
     ex = ThreadPoolExecutor(workers)
     try:
+        backup_meta(tr, root, errors)
+        if a.queues:
+            queues = list(dict.fromkeys(q.strip() for q in a.queues.split(",") if q.strip()))
+        else:
+            queues = [q["key"] for q in pages(tr, f"{API}/queues")]
+        dump(root / "queues.json", queues)
+
         for q in queues:
-            prog = backup_queue(tr, ex, q, state.get(q), root, not a.no_files, workers * 4)
+            prog = Progress(q, errors)
+            backup_queue(tr, ex, prog, None if a.full else state.get(q), root, not a.no_files, workers * 4)
             total += prog.done
             failed += prog.failed
-            log.info("%s: готово %d, ошибок %d", q, prog.done, len(prog.failed))
+            log.info("%s: готово %d, ошибок %d", q, prog.done, prog.failed)
             if not prog.failed:  # с ошибками не сдвигаем state — в следующий раз перекачаем
                 state[q] = started
                 dump(state_f, state)
     except KeyboardInterrupt:
         log.warning("прервано, state для текущей очереди не сохранён")
-        ex.shutdown(wait=False, cancel_futures=True)
-        sys.exit(130)
-    except NoTokensLeft as e:
-        ex.shutdown(wait=False, cancel_futures=True)
-        sys.exit(f"остановка: {e}")
-    ex.shutdown()
+        code = 130
+    except (NoTokensLeft, requests.RequestException, ValueError) as e:
+        log.error("остановка: %s", e)
+        code = 2
+    finally:
+        ex.shutdown(wait=code == 0, cancel_futures=code != 0)
+        dump(root / "errors.json", errors)
 
-    dump(root / "errors.json", failed)
-    log.info("done: %d issues, ошибок %d; %s", total, len(failed), pool.stats())
-    sys.exit(1 if failed else 0)
+    log.info("done: %d issues, ошибок по задачам %d, всего записей в errors.json %d; %s",
+             total, failed, len(errors), pool.stats())
+    sys.exit(code or (1 if errors else 0))
 
 
 if __name__ == "__main__":
