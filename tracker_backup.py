@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
@@ -340,15 +341,48 @@ def pages(tr: Tracker, url: str, **params) -> list:
 
 # ---------------------------------------------------------------- backup
 
-def dump(p: Path, data):
-    """Пишет во временный файл и переименовывает: готовый файл не бывает полузаписанным."""
+def _fsync_dir(d: Path):
+    try:
+        fd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass  # не везде можно сделать fsync каталога — тогда остаётся только fsync файла
+
+
+def dump(p: Path, data, durable: bool = False):
+    """Пишет во временный файл и переименовывает: готовый файл не бывает полузаписанным.
+
+    durable=True — для служебных файлов (state.json, pending.json): данные принудительно сбрасываются
+    на диск, чтобы пережить отключение питания. Файлы задач так не пишутся — их целостность при
+    продолжении прерванной выгрузки проверяет issue_complete.
+    """
     tmp = p.with_name(p.name + ".tmp")
     try:
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, ensure_ascii=False, indent=2))
+            if durable:
+                fh.flush()
+                os.fsync(fh.fileno())
         os.replace(tmp, p)
+        if durable:
+            _fsync_dir(p.parent)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def load_json(p: Path, default):
+    """Читает служебный JSON; повреждённый файл (например, после отключения питания) не роняет скрипт."""
+    if not p.exists():
+        return default
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except ValueError as e:
+        log.warning("%s повреждён (%s) — считаем, что его нет", p, e)
+        return default
 
 
 def safe_name(name: str) -> str:
@@ -443,16 +477,17 @@ class Progress:
 
     def __init__(self, q: str, errors: list):
         self.q, self.errors = q, errors
-        self.done = self.failed = self.att_failed = 0
+        self.done = self.failed = self.att_failed = self.skipped = 0
         self.retry: set[str] = set()    # задачи с недокачанными вложениями — повторить в следующий раз
         self.cleared: set[str] = set()  # задачи из прошлого списка на повтор, которые теперь в порядке
         self.fatal: BaseException | None = None
         self.lock = threading.Lock()
         self.last_log = time.monotonic()
 
-    def ok(self, key: str):
+    def ok(self, key: str, skipped: bool = False):
         with self.lock:
             self.done += 1
+            self.skipped += skipped
             if time.monotonic() - self.last_log > 10:
                 self.last_log = time.monotonic()
                 log.info("%s: %d issues (последний %s)", self.q, self.done, key)
@@ -472,13 +507,103 @@ class Progress:
         log.error("%s: %s", key, e)
 
 
+KEY_RE = re.compile(r"^[A-Za-z0-9_]+-\d+$")
+
+
+class Journal:
+    """Журнал выгрузки очереди <QUEUE>/_queue/progress — для продолжения после обрыва.
+
+    Первая строка — JSON с параметрами прогона (started, since, with_files), дальше по ключу
+    полностью выгруженной задачи в строке. Журнал живёт, пока очередь не выгружена целиком: если
+    прогон оборвался, следующий с теми же параметрами пропускает готовые задачи, а отметку в
+    state.json ставит по started первого прогона — изменения, сделанные пока бекап стоял,
+    подхватит следующий инкрементальный запуск.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.done: set[str] = set()
+        self.fh = None
+        self.lock = threading.Lock()
+        self.unsynced = 0
+
+    def _load(self):
+        try:
+            lines = self.path.read_text(encoding="utf-8", errors="replace").split("\n")
+            header = json.loads(lines[0])
+            if not isinstance(header, dict) or "started" not in header:
+                return None
+        except (OSError, ValueError, IndexError):
+            return None
+        # хвост после отключения питания может быть оборван или забит мусором — берём только ключи
+        return header, {l.strip() for l in lines[1:] if KEY_RE.match(l.strip())}
+
+    def open(self, started: str, since: str | None, with_files: bool) -> str | None:
+        """Начинает журнал или продолжает прерванный. Возвращает started прерванного прогона или None."""
+        prev = self._load() if self.path.exists() else None
+        resumed = None
+        header = {"started": started, "since": since, "with_files": with_files}
+        if prev and prev[0].get("since") == since and prev[0].get("with_files") == with_files:
+            header, self.done = prev[0], prev[1]
+            resumed = header["started"]
+        # переписываем журнал начисто: дописывать к оборванной строке нельзя
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(header, ensure_ascii=False) + "\n")
+            fh.writelines(k + "\n" for k in sorted(self.done))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.path)
+        _fsync_dir(self.path.parent)
+        self.fh = open(self.path, "a", encoding="utf-8")
+        return resumed
+
+    def add(self, key: str):
+        with self.lock:
+            self.fh.write(key + "\n")
+            self.fh.flush()
+            self.unsynced += 1
+            if self.unsynced >= 100:  # потерянный хвост журнала — лишь повторная выгрузка этих задач
+                os.fsync(self.fh.fileno())
+                self.unsynced = 0
+
+    def close(self):
+        with self.lock:
+            if self.fh:
+                self.fh.flush()
+                os.fsync(self.fh.fileno())
+                self.fh.close()
+                self.fh = None
+
+    def remove(self):
+        self.close()
+        self.path.unlink(missing_ok=True)
+
+
+def issue_complete(d: Path, with_files: bool) -> bool:
+    """Все файлы задачи на месте и читаются — проверка перед тем, как пропустить задачу из журнала."""
+    try:
+        for name in ("issue", "comments", "changelog", "links"):
+            json.loads((d / f"{name}.json").read_text(encoding="utf-8"))
+        if with_files:
+            for a in json.loads((d / "attachments.json").read_text(encoding="utf-8")):
+                f = d / "attachments" / safe_name(f'{a["id"]}_{a["name"]}')
+                if not f.exists() or f.stat().st_size != a.get("size", -1):
+                    return False
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return True
+
+
 def backup_queue(tr: Tracker, ex: ThreadPoolExecutor, prog: Progress, since: str | None,
                  root: Path, with_files: bool, inflight: int, limit: int | None = None,
-                 retry_keys: list[str] = ()) -> int:
+                 retry_keys: list[str] = (), journal: Journal | None = None) -> int:
     """Выгружает очередь и возвращает число задач, найденных поиском.
 
     retry_keys — задачи, у которых в прошлые прогоны не скачались вложения: они обрабатываются
     снова, даже если не изменились с последней отметки.
+    journal — журнал выгрузки: задачи из него, файлы которых целы, пропускаются; готовые дописываются.
     """
     q = prog.q
     backup_queue_meta(tr, prog, root)
@@ -497,16 +622,23 @@ def backup_queue(tr: Tracker, ex: ThreadPoolExecutor, prog: Progress, since: str
     keyset = set(keys)
     extra = [k for k in retry_keys if k not in keyset]
     log.info("%s: найдено %d задач%s", q, found, f", повтор вложений для {len(extra)}" if extra else "")
+    done_before = journal.done if journal else set()
 
     sem = threading.BoundedSemaphore(inflight)  # ограничиваем число задач в работе
 
     def run(key):
         try:
+            if key in done_before and key not in retry and issue_complete(issue_dir(root, key), with_files):
+                prog.ok(key, skipped=True)
+                return
             failed = backup_issue(tr, key, root, with_files)
             if failed:
-                prog.attachments_failed(key, failed)
-            elif key in retry:
-                prog.cleared.add(key)
+                prog.attachments_failed(key, failed)  # в журнал не пишем — при продолжении повторим
+            else:
+                if key in retry:
+                    prog.cleared.add(key)
+                if journal:
+                    journal.add(key)
             prog.ok(key)
         except NoTokensLeft as e:
             prog.fatal = e
@@ -593,12 +725,19 @@ def main():
 
     root = Path(a.out)
     root.mkdir(parents=True, exist_ok=True)
+    # два прогона в один каталог портят друг другу файлы; блокировка снимается сама при выходе процесса
+    lock_fh = open(root / ".lock", "w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.warning("в %s уже идёт бекап — выходим", root)
+        sys.exit(0)
     state_f = root / "state.json"
     # --full не трогает отметки очередей, которые в этот прогон не входят
-    state = json.loads(state_f.read_text()) if state_f.exists() else {}
+    state = load_json(state_f, {})
     # задачи с недокачанными вложениями по очередям: повторяются в каждом прогоне, пока не скачаются
     pending_f = root / "pending.json"
-    pending: dict[str, list[str]] = json.loads(pending_f.read_text()) if pending_f.exists() else {}
+    pending: dict[str, list[str]] = load_json(pending_f, {})
     started = (datetime.now(timezone.utc) - STATE_OVERLAP).strftime("%Y-%m-%dT%H:%M:%S.000+0000")
 
     errors: list = []
@@ -617,10 +756,24 @@ def main():
             prog = Progress(q, errors)
             progs.append(prog)
             old_retry = pending.get(q, []) if a.limit is None and not a.no_files else []
-            found = backup_queue(tr, ex, prog, None if a.full else state.get(q), root, not a.no_files,
-                                 workers * 4, a.limit, old_retry)
-            log.info("%s: готово %d, ошибок %d, недокачанных вложений %d",
-                     q, prog.done, prog.failed, prog.att_failed)
+            since = None if a.full else state.get(q)
+            q_started = started
+            journal = None
+            if a.limit is None:  # с --limit выгружается лишь часть очереди — продолжать нечего
+                journal = Journal(root / q / "_queue" / "progress")
+                resumed = journal.open(started, since, not a.no_files)
+                if resumed:
+                    q_started = resumed
+                    log.info("%s: продолжаем выгрузку, прерванную после старта в %s; уже готово %d задач",
+                             q, resumed, len(journal.done))
+            try:
+                found = backup_queue(tr, ex, prog, since, root, not a.no_files, workers * 4, a.limit,
+                                     old_retry, journal)
+            finally:
+                if journal:
+                    journal.close()
+            log.info("%s: готово %d (из них уже было выгружено %d), ошибок %d, недокачанных вложений %d",
+                     q, prog.done, prog.skipped, prog.failed, prog.att_failed)
             if a.limit is None and not a.no_files:
                 new_retry = sorted((set(old_retry) - prog.cleared) | prog.retry)
                 if new_retry != sorted(old_retry):
@@ -628,7 +781,7 @@ def main():
                         pending[q] = new_retry
                     else:
                         pending.pop(q, None)
-                    dump(pending_f, pending)
+                    dump(pending_f, pending, durable=True)
             # Недокачанные вложения state не блокируют — они в pending.json и повторятся в следующий раз.
             # Не сдвигаем state: с ошибками — в следующий раз перекачаем; с --limit выгружена лишь часть;
             # при пустом поиске — Трекер может временно отдавать пустой результат (нет прав, нагрузка),
@@ -641,9 +794,13 @@ def main():
                                 "отметка в state.json не изменена", q)
                 else:
                     log.info("%s: изменений с %s нет, отметка в state.json не изменена", q, state[q])
+                if journal and not journal.done:
+                    journal.remove()
                 continue
-            state[q] = started
-            dump(state_f, state)
+            state[q] = q_started
+            dump(state_f, state, durable=True)
+            if journal:
+                journal.remove()
     except KeyboardInterrupt:
         log.warning("прервано (Ctrl+C / SIGTERM), state для текущей очереди не сохранён")
         code = 130

@@ -37,12 +37,6 @@ set +a
 OUT="${TRACKER_BACKUP_OUT:-$DIR/backup}"
 mkdir -p "$OUT"
 
-# Не даём запустить второй бекап в тот же каталог, пока идёт первый (cron, ручной запуск).
-# flock есть в Linux; в macOS — brew install flock, без него проверка пропускается.
-if command -v flock >/dev/null 2>&1; then
-    exec 9>"$OUT/.lock"
-    flock -n 9 || { echo "run_backup: бекап в $OUT уже идёт, выходим" >&2; exit 0; }
-fi
-
-# exec: SIGTERM приходит прямо в Python (он корректно завершается), блокировка — через унаследованный fd 9
+# exec: SIGTERM приходит прямо в Python, и он корректно завершается.
+# От параллельного запуска в тот же каталог защищает сам tracker_backup.py (блокировка <out>/.lock).
 exec "$PYTHON" "$DIR/tracker_backup.py" --out "$OUT" --queues "$QUEUES" --tokens-file "$TOKENS_FILE" "$@"
