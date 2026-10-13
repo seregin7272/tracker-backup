@@ -201,6 +201,37 @@ tracker_backup.py --out /backup/tracker --queues OPS --full --no-files
 остановке. Код выхода: 0 — без ошибок, 1 — есть ошибки, 2 — остановка (все токены отозваны или не
 удалось получить список очередей), 130 — прервано по Ctrl+C.
 
+## Скрипт `run_backup.sh`
+
+Обёртка для бекапа очередей `HRTECH`, `PRODUCTIV` и `HROPS` (список задан в начале скрипта).
+Переменные окружения берутся из `tracker-backup.env`, токены — из `tracker-backup.tokens`; оба
+файла лежат рядом со скриптом и в git не попадают.
+
+```bash
+cp tracker-backup.env.example tracker-backup.env        # заполнить TRACKER_ORG_ID и т.д.
+cp tracker-backup.tokens.example tracker-backup.tokens  # по токену в строке
+chmod 600 tracker-backup.tokens
+
+./run_backup.sh                  # инкрементальный бекап
+./run_backup.sh --limit 3 -v     # пробный прогон
+./run_backup.sh --full           # любые аргументы передаются tracker_backup.py
+```
+
+- Каталог бекапа — `TRACKER_BACKUP_OUT` из `tracker-backup.env`, по умолчанию `./backup`.
+- Пути можно переопределить переменными: `ENV_FILE`, `TOKENS_FILE`, `PYTHON` (по умолчанию
+  `.venv/bin/python`).
+- Если `flock` доступен (Linux), второй запуск в тот же каталог, пока идёт первый, просто выходит
+  с кодом 0. Блокировка — файл `.lock` в каталоге бекапа.
+- Если файл токенов доступен на чтение всем пользователям, скрипт предупредит об этом.
+- Коды выхода — те же, что у `tracker_backup.py`; 2 — ещё и при отсутствии env-файла, файла токенов
+  или venv.
+
+Для cron:
+
+```cron
+30 3 * * * /opt/tracker-backup/run_backup.sh >> /var/log/tracker-backup.log 2>&1
+```
+
 ## Ежедневный запуск по cron
 
 Cron запускает команды с почти пустым окружением, поэтому переменные лучше вынести в отдельный файл,

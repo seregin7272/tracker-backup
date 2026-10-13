@@ -6,3 +6,5 @@ tracker-backup
 backup
 tokens.txt
 *.env
+tracker-backup.tokens
+*.tokens

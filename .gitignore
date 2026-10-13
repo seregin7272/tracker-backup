@@ -4,3 +4,5 @@ __pycache__/
 tracker-backup/
 backup/
 tokens.txt
+tracker-backup.env
+tracker-backup.tokens
