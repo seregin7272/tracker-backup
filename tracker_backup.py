@@ -52,6 +52,7 @@ STATE_OVERLAP = timedelta(minutes=5)
 MAX_PAUSE = 300.0      # верхняя граница паузы токена, что бы ни прислал сервер
 ATTACHMENT_ATTEMPTS = 3  # битые вложения стабильно отдают 500 — долго повторять бессмысленно
 SCROLL_RESTARTS = 3    # сколько раз начинать поиск заново, если scroll оборвался
+SCROLL_PAGE_ATTEMPTS = 5  # попыток на одну страницу scroll при 5xx и сетевых ошибках
 
 log = logging.getLogger("tracker-backup")
 
@@ -64,6 +65,10 @@ class NoTokensLeft(RuntimeError):
 
 class PinnedTokenDead(RuntimeError):
     """Отозван токен, к которому привязан scroll; остальные токены могут быть живы."""
+
+
+class ScrollIncomplete(RuntimeError):
+    """Scroll дошёл до конца, но задач меньше, чем обещал X-Total-Count: страница потерялась."""
 
 
 class Token:
@@ -229,10 +234,26 @@ class Tracker:
         return self.request("GET", url, **kw)
 
 
-def scroll(tr: Tracker, body: dict, per_scroll: int = 1000):
-    """Scroll-поиск (обходит лимит 10k). Scroll привязан к токену первого запроса."""
+def _retryable(e: requests.RequestException) -> bool:
+    if isinstance(e, (requests.ConnectionError, requests.Timeout)):
+        return True
+    return isinstance(e, requests.HTTPError) and e.response is not None and e.response.status_code in RETRY_STATUSES
+
+
+def scroll(tr: Tracker, body: dict, per_scroll: int = 1000, meta: dict | None = None):
+    """Scroll-поиск (обходит лимит 10k). Scroll привязан к токену первого запроса.
+
+    В meta кладутся total (X-Total-Count первого ответа, -1 если его нет) и retried — повторялось ли
+    продолжение scroll: тогда search_keys сверяет число задач с total.
+    """
+    meta = {} if meta is None else meta
     params = {"scrollType": "sorted", "perScroll": per_scroll, "scrollTTLMillis": 60000}
     r = tr.request("POST", f"{API}/issues/_search", params=params, json=body)
+    try:
+        meta["total"] = int(r.headers.get("X-Total-Count", -1))
+    except ValueError:
+        meta["total"] = -1
+    meta["retried"] = False
     pin = r.token
     while True:
         page = r.json()
@@ -240,9 +261,19 @@ def scroll(tr: Tracker, body: dict, per_scroll: int = 1000):
         sid = r.headers.get("X-Scroll-Id")
         if not page or not sid:
             return
-        # повтор продолжения с тем же scrollId может молча пропустить страницу
-        r = tr.request("POST", f"{API}/issues/_search", pin=pin, retry=False,
-                       params={"scrollId": sid, "scrollTTLMillis": 60000}, json=body)
+        # Трекер иногда отвечает на продолжение 502. Повтор с тем же scrollId может пропустить страницу,
+        # если сервер успел её отдать, а ответ потерялся, — такой пропуск ловит сверка с X-Total-Count.
+        for i in range(SCROLL_PAGE_ATTEMPTS):
+            try:
+                r = tr.request("POST", f"{API}/issues/_search", pin=pin, retry=False,
+                               params={"scrollId": sid, "scrollTTLMillis": 60000}, json=body)
+                break
+            except requests.RequestException as e:
+                if i + 1 == SCROLL_PAGE_ATTEMPTS or not _retryable(e):
+                    raise
+                meta["retried"] = True
+                log.info("продолжение scroll не удалось (%s), повтор через %ds", e, 2 ** (i + 1))
+                time.sleep(2 ** (i + 1))
 
 
 def scroll_page_size(limit: int | None) -> int:
@@ -258,17 +289,22 @@ def search_keys(tr: Tracker, body: dict, on_issue, limit: int | None = None) -> 
     при обрыве начинает заново."""
     for attempt in range(SCROLL_RESTARTS + 1):
         keys: dict[str, None] = {}
+        meta: dict = {}
         try:
-            for issue in scroll(tr, body, scroll_page_size(limit)):
+            for issue in scroll(tr, body, scroll_page_size(limit), meta):
                 on_issue(issue)
                 keys[issue["key"]] = None
                 if limit is not None and len(keys) >= limit:
-                    break
+                    return list(keys)
+            if meta["retried"] and len(keys) < meta["total"]:
+                raise ScrollIncomplete(f"после повторов получено {len(keys)} задач из {meta['total']}")
             return list(keys)
-        except (requests.RequestException, ValueError, PinnedTokenDead) as e:
+        except (requests.RequestException, ValueError, PinnedTokenDead, ScrollIncomplete) as e:
             if attempt == SCROLL_RESTARTS:
                 raise
-            log.warning("scroll оборвался после %d задач (%s), поиск заново", len(keys), e)
+            pause = min(60, 5 * 2 ** attempt)
+            log.warning("scroll оборвался после %d задач (%s), поиск заново через %ds", len(keys), e, pause)
+            time.sleep(pause)
 
 
 def paged(tr: Tracker, url: str) -> list:
@@ -453,7 +489,7 @@ def backup_queue(tr: Tracker, ex: ThreadPoolExecutor, prog: Progress, since: str
         # с limit берём самые свежие задачи — для проверки они интереснее
         body = {"filter": flt, "order": "+updated" if limit is None else "-updated"}
         keys = search_keys(tr, body, lambda issue: save_issue(root, issue), limit)
-    except (requests.RequestException, ValueError, PinnedTokenDead) as e:
+    except (requests.RequestException, ValueError, PinnedTokenDead, ScrollIncomplete) as e:
         prog.fail(f"{q}/_search", e)
         return 0
     found = len(keys)
