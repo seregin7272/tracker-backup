@@ -50,6 +50,7 @@ API = os.getenv("TRACKER_API", "https://api.tracker.yandex.net/v3")
 RETRY_STATUSES = {500, 502, 503, 504}
 STATE_OVERLAP = timedelta(minutes=5)
 MAX_PAUSE = 300.0      # верхняя граница паузы токена, что бы ни прислал сервер
+ATTACHMENT_ATTEMPTS = 3  # битые вложения стабильно отдают 500 — долго повторять бессмысленно
 SCROLL_RESTARTS = 3    # сколько раз начинать поиск заново, если scroll оборвался
 
 log = logging.getLogger("tracker-backup")
@@ -188,14 +189,15 @@ class Tracker:
         return s
 
     def request(self, method: str, url: str, pin: Token | None = None, retry: bool = True,
-                **kw) -> requests.Response:
+                attempts: int | None = None, **kw) -> requests.Response:
         """Запрос через пул. В r.token кладётся токен, которым запрос выполнен.
 
         retry=False — для неидемпотентных запросов: таймауты и 5xx не повторяются
         (сервер мог успеть обработать запрос), повторяется только 429.
+        attempts — сколько раз пробовать при таймаутах и 5xx (по умолчанию self.attempts).
         """
         errors = throttles = 0
-        attempts = self.attempts if retry else 1
+        attempts = (attempts or self.attempts) if retry else 1
         while True:
             tok = self.pool.acquire(pin)
             try:
@@ -331,7 +333,7 @@ def download(tr: Tracker, url: str, dst: Path, attempts: int = 3):
     part = dst.with_name(dst.name + ".part")
     for i in range(attempts):
         try:
-            with tr.get(url, stream=True) as r, open(part, "wb") as fh:
+            with tr.get(url, stream=True, attempts=ATTACHMENT_ATTEMPTS) as r, open(part, "wb") as fh:
                 for chunk in r.iter_content(1 << 20):
                     fh.write(chunk)
             os.replace(part, dst)
@@ -344,22 +346,34 @@ def download(tr: Tracker, url: str, dst: Path, attempts: int = 3):
             part.unlink(missing_ok=True)
 
 
-def backup_issue(tr: Tracker, key: str, root: Path, with_files: bool):
-    """Всё, кроме самой задачи: issue.json уже сохранён на этапе поиска."""
+def backup_issue(tr: Tracker, key: str, root: Path, with_files: bool) -> list[dict]:
+    """Всё, кроме самой задачи: issue.json уже сохранён на этапе поиска.
+
+    Возвращает вложения, которые не удалось скачать: такие встречаются в Трекере (сервер стабильно
+    отдаёт 500 «insufficient content written»), и из-за одного битого файла не должны теряться
+    остальные файлы задачи.
+    """
     d = issue_dir(root, key)
+    d.mkdir(parents=True, exist_ok=True)
     dump(d / "comments.json", paged(tr, f"{API}/issues/{key}/comments"))
     dump(d / "changelog.json", paged(tr, f"{API}/issues/{key}/changelog"))
     dump(d / "links.json", tr.get(f"{API}/issues/{key}/links").json())
     if not with_files:
-        return
+        return []
     atts = tr.get(f"{API}/issues/{key}/attachments").json()
     dump(d / "attachments.json", atts)
+    failed = []
     for a in atts:
         f = d / "attachments" / safe_name(f'{a["id"]}_{a["name"]}')
         if f.exists() and f.stat().st_size == a.get("size", -1):
             continue
         f.parent.mkdir(exist_ok=True)
-        download(tr, a["content"], f)
+        try:
+            download(tr, a["content"], f)
+        except requests.RequestException as e:
+            failed.append({"type": "attachment", "key": f'{key}/attachments/{a["id"]}',
+                           "name": a["name"], "error": repr(e)})
+    return failed
 
 
 def backup_meta(tr: Tracker, root: Path, errors: list):
@@ -393,7 +407,9 @@ class Progress:
 
     def __init__(self, q: str, errors: list):
         self.q, self.errors = q, errors
-        self.done = self.failed = 0
+        self.done = self.failed = self.att_failed = 0
+        self.retry: set[str] = set()    # задачи с недокачанными вложениями — повторить в следующий раз
+        self.cleared: set[str] = set()  # задачи из прошлого списка на повтор, которые теперь в порядке
         self.fatal: BaseException | None = None
         self.lock = threading.Lock()
         self.last_log = time.monotonic()
@@ -405,6 +421,14 @@ class Progress:
                 self.last_log = time.monotonic()
                 log.info("%s: %d issues (последний %s)", self.q, self.done, key)
 
+    def attachments_failed(self, key: str, items: list[dict]):
+        with self.lock:
+            self.att_failed += len(items)
+            self.retry.add(key)
+            self.errors.extend(items)
+        for i in items:
+            log.warning("%s: вложение «%s» не скачано: %s", key, i["name"], i["error"])
+
     def fail(self, key: str, e: BaseException):
         with self.lock:
             self.failed += 1
@@ -413,8 +437,13 @@ class Progress:
 
 
 def backup_queue(tr: Tracker, ex: ThreadPoolExecutor, prog: Progress, since: str | None,
-                 root: Path, with_files: bool, inflight: int, limit: int | None = None) -> int:
-    """Выгружает очередь и возвращает число задач, найденных поиском."""
+                 root: Path, with_files: bool, inflight: int, limit: int | None = None,
+                 retry_keys: list[str] = ()) -> int:
+    """Выгружает очередь и возвращает число задач, найденных поиском.
+
+    retry_keys — задачи, у которых в прошлые прогоны не скачались вложения: они обрабатываются
+    снова, даже если не изменились с последней отметки.
+    """
     q = prog.q
     backup_queue_meta(tr, prog, root)
     flt = {"queue": q}
@@ -427,22 +456,36 @@ def backup_queue(tr: Tracker, ex: ThreadPoolExecutor, prog: Progress, since: str
     except (requests.RequestException, ValueError, PinnedTokenDead) as e:
         prog.fail(f"{q}/_search", e)
         return 0
-    log.info("%s: найдено %d задач", q, len(keys))
+    found = len(keys)
+    retry = set(retry_keys)
+    keyset = set(keys)
+    extra = [k for k in retry_keys if k not in keyset]
+    log.info("%s: найдено %d задач%s", q, found, f", повтор вложений для {len(extra)}" if extra else "")
 
     sem = threading.BoundedSemaphore(inflight)  # ограничиваем число задач в работе
 
     def run(key):
         try:
-            backup_issue(tr, key, root, with_files)
+            failed = backup_issue(tr, key, root, with_files)
+            if failed:
+                prog.attachments_failed(key, failed)
+            elif key in retry:
+                prog.cleared.add(key)
             prog.ok(key)
         except NoTokensLeft as e:
             prog.fatal = e
+        except requests.HTTPError as e:
+            if key in retry and e.response is not None and e.response.status_code == 404:
+                log.warning("%s: задача из списка на повтор больше не существует, убираем её из списка", key)
+                prog.cleared.add(key)
+            else:
+                prog.fail(key, e)
         except Exception as e:
             prog.fail(key, e)
         finally:
             sem.release()
 
-    for key in keys:
+    for key in keys + extra:
         if prog.fatal:
             break
         sem.acquire()
@@ -451,7 +494,7 @@ def backup_queue(tr: Tracker, ex: ThreadPoolExecutor, prog: Progress, since: str
         sem.acquire()
     if prog.fatal:
         raise prog.fatal
-    return len(keys)
+    return found
 
 
 def positive_int(v: str) -> int:
@@ -517,6 +560,9 @@ def main():
     state_f = root / "state.json"
     # --full не трогает отметки очередей, которые в этот прогон не входят
     state = json.loads(state_f.read_text()) if state_f.exists() else {}
+    # задачи с недокачанными вложениями по очередям: повторяются в каждом прогоне, пока не скачаются
+    pending_f = root / "pending.json"
+    pending: dict[str, list[str]] = json.loads(pending_f.read_text()) if pending_f.exists() else {}
     started = (datetime.now(timezone.utc) - STATE_OVERLAP).strftime("%Y-%m-%dT%H:%M:%S.000+0000")
 
     errors: list = []
@@ -534,9 +580,20 @@ def main():
         for q in queues:
             prog = Progress(q, errors)
             progs.append(prog)
+            old_retry = pending.get(q, []) if a.limit is None and not a.no_files else []
             found = backup_queue(tr, ex, prog, None if a.full else state.get(q), root, not a.no_files,
-                                 workers * 4, a.limit)
-            log.info("%s: готово %d, ошибок %d", q, prog.done, prog.failed)
+                                 workers * 4, a.limit, old_retry)
+            log.info("%s: готово %d, ошибок %d, недокачанных вложений %d",
+                     q, prog.done, prog.failed, prog.att_failed)
+            if a.limit is None and not a.no_files:
+                new_retry = sorted((set(old_retry) - prog.cleared) | prog.retry)
+                if new_retry != sorted(old_retry):
+                    if new_retry:
+                        pending[q] = new_retry
+                    else:
+                        pending.pop(q, None)
+                    dump(pending_f, pending)
+            # Недокачанные вложения state не блокируют — они в pending.json и повторятся в следующий раз.
             # Не сдвигаем state: с ошибками — в следующий раз перекачаем; с --limit выгружена лишь часть;
             # при пустом поиске — Трекер может временно отдавать пустой результат (нет прав, нагрузка),
             # и сдвинутая отметка навсегда отрезала бы старые задачи. Повторный пустой поиск — один запрос.
@@ -562,8 +619,9 @@ def main():
         dump(root / "errors.json", errors)
 
     total, failed = sum(p.done for p in progs), sum(p.failed for p in progs)
-    log.info("done: %d issues, ошибок в очередях %d, всего записей в errors.json %d; %s",
-             total, failed, len(errors), pool.stats())
+    att_failed = sum(p.att_failed for p in progs)
+    log.info("done: %d issues, ошибок в очередях %d, недокачанных вложений %d, всего записей в errors.json %d; %s",
+             total, failed, att_failed, len(errors), pool.stats())
     sys.exit(code or (1 if errors else 0))
 
 
